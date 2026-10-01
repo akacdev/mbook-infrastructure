@@ -1,0 +1,11 @@
+[Definition]
+allowipv6 = auto
+actionban = curl --fail --silent --show-error 'https://api.abuseipdb.com/api/v2/report' \
+           -H 'Accept: application/json' \
+           -H 'Key: <abuseipdb_apikey>' \
+           --data-urlencode 'ip=<ip>' \
+           --data-urlencode 'comment=OpenSSH bruteforce - failed attempts: <failures>' \
+           --data 'categories=<abuseipdb_category>'
+
+[Init]
+abuseipdb_apikey = REPLACE_WITH_SECRET

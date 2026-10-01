@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+umask 077
+
+readonly CONFIG_FILE='/etc/mbook-deploy.conf'
+readonly LOCK_FILE='/run/lock/mbook-deploy.lock'
+readonly DOCKER='/usr/bin/docker'
+readonly CURL='/usr/bin/curl'
+readonly LOGGER='/usr/bin/logger'
+
+log() {
+  printf '[mbook-deploy] %s\n' "$*"
+  "$LOGGER" -t mbook-deploy -- "$*" || true
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_root_owned_safe_file() {
+  local path="$1"
+
+  [[ -f "$path" ]] || die "Required file does not exist: $path"
+  [[ ! -L "$path" ]] || die "Refusing symlinked file: $path"
+  [[ "$(stat -c '%u' -- "$path")" == '0' ]] || die "File is not owned by root: $path"
+
+  local mode
+  mode="$(stat -c '%a' -- "$path")"
+  (( (8#$mode & 0022) == 0 )) || die "File is writable by group/others: $path (mode $mode)"
+}
+
+require_root_owned_safe_dir() {
+  local path="$1"
+
+  [[ -d "$path" ]] || die "Required directory does not exist: $path"
+  [[ ! -L "$path" ]] || die "Refusing symlinked directory: $path"
+  [[ "$(stat -c '%u' -- "$path")" == '0' ]] || die "Directory is not owned by root: $path"
+
+  local mode
+  mode="$(stat -c '%a' -- "$path")"
+  (( (8#$mode & 0022) == 0 )) || die "Directory is writable by group/others: $path (mode $mode)"
+}
+
+validate_image_ref() {
+  local image="$1"
+  local prefix="${ALLOWED_IMAGE_REPOSITORY}@sha256:"
+
+  [[ "$image" == "$prefix"* ]] || return 1
+
+  local digest="${image#"$prefix"}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+}
+
+read_current_image() {
+  if [[ ! -e "$DEPLOY_ENV_FILE" ]]; then
+    return 0
+  fi
+
+  require_root_owned_safe_file "$DEPLOY_ENV_FILE"
+
+  local line
+  line="$(grep -E '^MBOOK_IMAGE=' "$DEPLOY_ENV_FILE" | head -n 1 || true)"
+  [[ -n "$line" ]] || return 0
+  printf '%s\n' "${line#MBOOK_IMAGE=}"
+}
+
+write_deploy_env() {
+  local image="$1"
+  local tmp
+
+  tmp="$(mktemp "${DEPLOY_ENV_FILE}.tmp.XXXXXX")"
+  printf 'MBOOK_IMAGE=%s\n' "$image" > "$tmp"
+  chown root:root "$tmp"
+  chmod 0600 "$tmp"
+  mv -fT -- "$tmp" "$DEPLOY_ENV_FILE"
+}
+
+compose_with_deploy_env() {
+  local deploy_env="$1"
+  shift
+
+  "$DOCKER" compose \
+    --project-name mbook \
+    --project-directory "$COMPOSE_DIR" \
+    --file "$COMPOSE_FILE" \
+    --env-file "$SECRETS_ENV_FILE" \
+    --env-file "$deploy_env" \
+    "$@"
+}
+
+compose() {
+  compose_with_deploy_env "$DEPLOY_ENV_FILE" "$@"
+}
+
+container_is_running() {
+  [[ "$("$DOCKER" inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == 'true' ]]
+}
+
+running_image_ref() {
+  "$DOCKER" inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true
+}
+
+http_is_healthy() {
+  local code
+  code="$("$CURL" \
+    --silent \
+    --show-error \
+    --output /dev/null \
+    --write-out '%{http_code}' \
+    --max-time 5 \
+    "$HEALTHCHECK_URL" 2>/dev/null || true)"
+
+  [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+}
+
+wait_for_health() {
+  local attempt
+
+  for ((attempt = 1; attempt <= HEALTHCHECK_ATTEMPTS; attempt++)); do
+    if container_is_running && http_is_healthy; then
+      log "Health check passed on attempt ${attempt}/${HEALTHCHECK_ATTEMPTS}."
+      return 0
+    fi
+
+    sleep "$HEALTHCHECK_INTERVAL_SECONDS"
+  done
+
+  return 1
+}
+
+rollback() {
+  local previous_image="$1"
+
+  if [[ -z "$previous_image" ]]; then
+    log 'Rollback unavailable: no previous deployed image was recorded.'
+    return 1
+  fi
+
+  if ! validate_image_ref "$previous_image"; then
+    log "Rollback unavailable: previous image reference is not an allowed immutable digest: $previous_image"
+    return 1
+  fi
+
+  log "Rolling back to $previous_image"
+
+  "$DOCKER" pull "$previous_image"
+  write_deploy_env "$previous_image"
+
+  if ! compose config --quiet; then
+    log 'Rollback Compose configuration validation failed.'
+    return 1
+  fi
+
+  if ! compose up -d --no-deps --pull never backend; then
+    log 'Rollback container recreation failed.'
+    return 1
+  fi
+
+  if wait_for_health; then
+    log "Rollback completed successfully: $previous_image"
+    return 0
+  fi
+
+  log 'CRITICAL: rollback container did not pass health verification.'
+  return 1
+}
+
+main() {
+  [[ "$EUID" -eq 0 ]] || die 'This command must run as root.'
+  [[ "$#" -eq 1 ]] || die 'Usage: mbook-deploy <ghcr.io/.../mbook@sha256:...>'
+
+  [[ -x "$DOCKER" ]] || die "Docker executable not found at $DOCKER"
+  [[ -x "$CURL" ]] || die "curl executable not found at $CURL"
+
+  require_root_owned_safe_file "$CONFIG_FILE"
+  source "$CONFIG_FILE"
+
+  : "${ALLOWED_IMAGE_REPOSITORY:?Missing ALLOWED_IMAGE_REPOSITORY}"
+  : "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+  : "${COMPOSE_FILE:?Missing COMPOSE_FILE}"
+  : "${SECRETS_ENV_FILE:?Missing SECRETS_ENV_FILE}"
+  : "${DEPLOY_ENV_FILE:?Missing DEPLOY_ENV_FILE}"
+  : "${CONTAINER_NAME:?Missing CONTAINER_NAME}"
+  : "${HEALTHCHECK_URL:?Missing HEALTHCHECK_URL}"
+  : "${HEALTHCHECK_ATTEMPTS:?Missing HEALTHCHECK_ATTEMPTS}"
+  : "${HEALTHCHECK_INTERVAL_SECONDS:?Missing HEALTHCHECK_INTERVAL_SECONDS}"
+
+  local new_image="$1"
+  validate_image_ref "$new_image" || die "Image reference is not allowed: $new_image"
+
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die 'Another MBook deployment is already in progress.'
+
+  require_root_owned_safe_dir "$COMPOSE_DIR"
+  require_root_owned_safe_file "$COMPOSE_FILE"
+  require_root_owned_safe_file "$SECRETS_ENV_FILE"
+
+  local previous_image
+  previous_image="$(read_current_image || true)"
+
+  if [[ "$previous_image" == "$new_image" ]]; then
+    log "Requested image is already recorded as deployed: $new_image"
+    if [[ "$(running_image_ref)" == "$new_image" ]] && container_is_running && http_is_healthy; then
+      log 'Current deployment is healthy and already uses the requested digest; nothing to do.'
+      exit 0
+    fi
+    log 'Recorded digest matches, but the running container differs or is unhealthy; recreating it.'
+  fi
+
+  log "Pulling immutable image $new_image"
+  "$DOCKER" pull "$new_image"
+
+  local candidate_env
+  candidate_env="$(mktemp "${DEPLOY_ENV_FILE}.candidate.XXXXXX")"
+  printf 'MBOOK_IMAGE=%s\n' "$new_image" > "$candidate_env"
+  chown root:root "$candidate_env"
+  chmod 0600 "$candidate_env"
+
+  if ! compose_with_deploy_env "$candidate_env" config --quiet; then
+    rm -f -- "$candidate_env"
+    die 'Compose configuration validation failed; persistent deployment state was not changed.'
+  fi
+  rm -f -- "$candidate_env"
+
+  write_deploy_env "$new_image"
+
+  log "Deploying $new_image"
+  if ! compose up -d --no-deps --pull never backend; then
+    log 'Container recreation failed.'
+    rollback "$previous_image" || true
+    exit 1
+  fi
+
+  if ! wait_for_health; then
+    log 'New deployment failed health verification. Container logs are intentionally not copied to CI output; inspect them locally on the server if needed.'
+
+    if rollback "$previous_image"; then
+      exit 1
+    fi
+
+    die 'Deployment failed and automatic rollback was not successful.'
+  fi
+
+  log "Deployment completed successfully: $new_image"
+}
+
+main "$@"

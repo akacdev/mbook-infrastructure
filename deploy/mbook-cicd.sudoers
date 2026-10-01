@@ -1,0 +1,5 @@
+Defaults:cicd env_reset
+Defaults:cicd secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults:cicd !setenv
+
+cicd ALL=(root) NOPASSWD: /usr/local/sbin/mbook-deploy *

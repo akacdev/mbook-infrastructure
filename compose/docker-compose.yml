@@ -1,0 +1,144 @@
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  seq-data:
+    external: true
+    name: seq-data
+
+services:
+  mongo:
+    image: mongo:8.0.32@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2
+    container_name: mbook-mongo
+    restart: unless-stopped
+    networks:
+      - internal
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - type: bind
+        source: /opt/mbook/mongodb-data
+        target: /data/db
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/mbook/mongo-init/create-users.js
+        target: /docker-entrypoint-initdb.d/create-users.js
+        read_only: true
+        bind:
+          create_host_path: false
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+
+      MONGO_ADMIN_USERNAME: ${MONGO_ADMIN_USERNAME}
+      MONGO_ADMIN_PASSWORD: ${MONGO_ADMIN_PASSWORD}
+      MONGO_PROD_USERNAME: ${MONGO_PROD_USERNAME}
+      MONGO_PROD_PASSWORD: ${MONGO_PROD_PASSWORD}
+      MONGO_EXPORT_USERNAME: ${MONGO_EXPORT_USERNAME}
+      MONGO_EXPORT_PASSWORD: ${MONGO_EXPORT_PASSWORD}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - SETUID
+      - SETGID
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "HOME=/tmp mongosh --quiet --norc --host 127.0.0.1 --port 27017 --eval 'quit(db.adminCommand({ ping: 1 }).ok ? 0 : 2)'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+
+  seq:
+    image: datalust/seq:2026.1.17182@sha256:9e9cc9183c6efaa7c187407d16901506ab3bc0aed7522bfc3ad7b529be30d8d8
+    container_name: mbook-seq
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      ACCEPT_EULA: "Y"
+      SEQ_FIRSTRUN_ADMINPASSWORDHASH: ${SEQ_ADMIN_PASSWORD_HASH}
+    volumes:
+      - seq-data:/data
+    ports:
+      - "127.0.0.1:5341:80"
+      - "127.0.0.1:5342:5341"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/seqsvr/Client/seqcli",
+          "node",
+          "health",
+          "-s",
+          "http://localhost"
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 256m
+
+  backend:
+    image: ${MBOOK_IMAGE:?MBOOK_IMAGE must be supplied via deploy.env or the shell}
+    container_name: mbook-backend
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - internal
+    ports:
+      - "0.0.0.0:3000:8080"
+    volumes:
+      - type: bind
+        source: /opt/mbook/config/MBookBackend.json
+        target: /app/config/MBookBackend.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/mbook/data-protection-keys
+        target: /var/lib/mbook/data-protection-keys
+    command:
+      - "--configurationFilePath=/app/config/MBookBackend.json"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 384m

@@ -1,0 +1,13 @@
+[Unit]
+Description=Configure Transparent Hugepages for MongoDB
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled && echo defer+madvise > /sys/kernel/mm/transparent_hugepage/defrag && echo 0 > /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

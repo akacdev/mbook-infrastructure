@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IPTABLES=/usr/sbin/iptables
+CHAIN=DOCKER-USER
+
+ALLOW=(-i ens18 -p tcp -s 192.168.4.1/32 -m conntrack --ctorigdstport 3000 -j ACCEPT)
+DROP=(-i ens18 -p tcp -m conntrack --ctorigdstport 3000 -j DROP)
+
+"$IPTABLES" -N "$CHAIN" 2>/dev/null || true
+
+while "$IPTABLES" -D "$CHAIN" "${ALLOW[@]}" 2>/dev/null; do :; done
+while "$IPTABLES" -D "$CHAIN" "${DROP[@]}" 2>/dev/null; do :; done
+
+"$IPTABLES" -I "$CHAIN" 1 "${DROP[@]}"
+"$IPTABLES" -I "$CHAIN" 1 "${ALLOW[@]}"

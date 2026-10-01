@@ -1,0 +1,1 @@
+restrict,port-forwarding,permitopen="127.0.0.1:27017" ssh-ed25519 <GITHUB_ACTIONS_PUBLIC_KEY> Github-Actions
